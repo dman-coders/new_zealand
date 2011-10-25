@@ -1,0 +1,158 @@
+<?php
+/**
+ * @file Rules to import the NZ geolocations into a vocabulary.
+ * 
+ * FYI, the original source CSV was derived from a postcode list reverse-
+ * engineered and released at http://www.noodles.net.nz/2007/09/14/new-zealand-
+ * postcode-database-v2/.
+ * 
+ * This SQL was imported, then the following query produes the
+ * NZ_suburbs_with_geolocation.csv we see here.
+ * 
+ * SELECT s.suburb as name, avg(st.latitude) as lat, avg(st.longitude) as lon,
+ * max (st.latitude) as 'top', max(st.longitude) as 'right', min(st.latitude) as
+ * 'bottom',  min(st.longitude) as 'left', s.area as parent, s.suburbid as id
+ * FROM suburbs s JOIN streets st ON st.suburb = s.suburbid GROUP BY s.suburb
+ * ORDER BY area, s.suburb
+ * 
+ * OR, to just get the 'areas', which need to be loaded first,
+ * NZ_regions_with_geolocation.csv
+ * 
+ * SELECT s.area as name, avg(st.latitude) as lat, avg(st.longitude) as lon, max
+ * (st.latitude) as 'top', max(st.longitude) as 'right', min(st.latitude) as
+ * 'bottom',  min(st.longitude) as 'left' FROM suburbs s JOIN streets st ON st.
+ * suburb = s.suburbid GROUP BY s.area ORDER BY area, s.suburb
+ */
+
+/**
+ * ctools API guff
+ */
+include_once('new_zealand.features.inc');
+
+define('LOCATIONS_VOCABULARY_NAME', 'locations' );
+define('LOCATIONS_IMPORTER_NAME', 'locations_terms' );
+
+/**
+ * Implementation of hook_enable().
+ * 
+ * @see ManagingNews, where this process was ripped from.
+ *
+ * @todo: move this to a features_rebuild() callback.
+ */
+function new_zealand_enable() {
+  
+  // Force exported vocabulary to be created first, so terms can be imported into
+  // them.
+  features_include();
+  module_load_include('inc', 'features', 'features.export');
+  #dpm('rebuilding the taxonomy');
+  taxonomy_features_rebuild('new_zealand');
+  // If you've got the names right, then features will not remake it
+  // each time, and just proceed if it's already there.
+
+  // Flag that our vocabulary is to be used with geolocation
+  $geotaxonomy_vocabularies = variable_get('geotaxonomy_vocabularies', array());
+  // $geotaxonomy_vocabularies usually keys by vid, but may also key by features machine_name
+  // the 'module' name is in the taxonomy definition, and must start with 'features_'.
+  $geotaxonomy_vocabularies['features_' . LOCATIONS_VOCABULARY_NAME] = 1;
+  variable_set('geotaxonomy_vocabularies', $geotaxonomy_vocabularies);
+
+  // Start importing the CSV
+  $files = array(
+    'NZ_regions_with_geolocation.csv',
+    'NZ_suburbs_with_geolocation.csv'
+  );
+  foreach ($files as $file) {
+    $path = file_directory_path() . '/locations';
+    if (file_check_directory($path, TRUE)) {
+      $filepath = "{$path}/{$file}";
+  
+      // Copy locations csv to file directory, avoid using shell_exec() for
+      // compatibility reasons.
+      if (!file_exists($filepath)) {
+        $src = file_get_contents(drupal_get_path('module', 'new_zealand') . "/{$file}");
+        file_put_contents($filepath, $src);
+      }
+  
+      // Import file, clear caches to verify to make sure 'locations' importer
+      // is available when installing with Aegir.
+      ctools_include('export');
+      ctools_export_load_object_reset('feeds_importer');
+      try {
+        // Ensure importer exists.
+        feeds_importer(LOCATIONS_IMPORTER_NAME)->existing();
+        // Thows an error if not
+        
+        $source = feeds_source(LOCATIONS_IMPORTER_NAME);
+        $source->addConfig(
+          array(
+            'FeedsFileFetcher' => array(
+              'source' => $filepath
+            ),
+          )
+        );
+        drupal_set_message(t("Loading file $filepath into vocab " . LOCATIONS_VOCABULARY_NAME . " using import process " . LOCATIONS_IMPORTER_NAME));
+  
+        while (FEEDS_BATCH_COMPLETE != $source->import());
+        drupal_set_message(t('Imported custom vocabulary and terms'));
+      }
+      catch (Exception $e) {
+        drupal_set_message(t('Could not import geo terms. Please import them manually from mn_world.csv in files directory.'), 'error');
+        watchdog(__FUNCTION__, $e->getMessage(), array(), WATCHDOG_ERROR);
+      }
+    }
+  }
+}
+
+function new_zealand_disable() {
+  drupal_set_message(t("Should now disable the " . LOCATIONS_VOCABULARY_NAME . " vocabulary?"));
+}
+
+
+
+
+/**
+ * Work with or against Feeds Taxonomy Term Processor. 
+ * Need to support 'parent' of imported terms if I can. Flat tag lists are dull
+ * 
+ * THIS IS NOT MY JOB and should have been done by feeds/mappers/taxonomy.inc
+ */
+
+/**
+ * Implementation of hook_feeds_term_processor_targets_alter().
+ *
+ * Expose the mapping targets for taxonomy terms. 
+ * FeedsTermProcessor will stick this value on $term['parent_term']. 
+ * Later, that value is converted into a parent term ID before the term is
+ * saved.
+ * 
+ * This func partially duplicates the 'parent_name' field that geotaxonomy
+ * uses, but geo puts its parent info in a different table.
+ * When I see a 'parent_name' value, I run the callback function instead.
+ */
+function new_zealand_feeds_term_processor_targets_alter(&$targets, $vid) {
+  $targets['parent_name'] = array(
+    'name' => t('Parent term name'),
+    'description' => t('The name of this term\'s parent term. Used to compute hierarchies of geo terms.'),
+    'callback' => 'new_zealand_feeds_set_target',
+  );
+}
+
+
+/**
+ * Set the target after import - by taking the named parent and finding its ID,
+ * so we can set the parent of this term.
+ */
+function new_zealand_feeds_set_target(&$term, $field_name, $value) {
+  if (!empty($value)) {
+    // taxonomy_get_term_by_name_vid is provided by feeds/mappers/taxonomy.inc
+    $parent_terms = taxonomy_get_term_by_name_vid($value, $term['vid']);
+    if (!empty($parent_terms)) {
+      foreach($parent_terms as $parent_term) {
+        // probably, hopefully, a loop of one.
+        $term['parent'][$parent_term->tid] = $parent_term->tid;
+      }
+    }
+  }
+  return $term;
+}
